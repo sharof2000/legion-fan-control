@@ -1,7 +1,12 @@
 # Legion Fan Control
 
+[![CI](https://github.com/sharof2000/legion-fan-control/actions/workflows/ci.yml/badge.svg)](https://github.com/sharof2000/legion-fan-control/actions/workflows/ci.yml)
+
 A tray app and a PowerShell tool for forcing the fans on a Lenovo Legion laptop to full
 speed, with a live readout of temperatures and fan RPM.
+
+![The Legion Fan Tray dashboard: CPU and GPU temperature gauges, both fan RPM bars, the
+mode buttons, and the auto-max and CPU cap controls.](docs/screenshot.png)
 
 > ### Read this first: hardware scope
 >
@@ -19,8 +24,9 @@ speed, with a live readout of temperatures and fan RPM.
 ## How this came about
 
 My laptop runs hot, and the fans never seemed to work as hard as I wanted them to. The stock
-Quiet / Balanced / Performance modes all idle both fans at around 2800 rpm, and Lenovo's own
-software gives you no way to say "just spin them faster."
+Quiet / Balanced / Performance modes hold both fans around 2300 rpm at 61 °C, and even at
+77 °C the controller only gives you about 2800. The hardware will do 4300, and Lenovo's own
+software gives you no way to ask for it.
 
 So I went looking for something that already solved this. That turned out to be a dead end.
 The generic fan utilities want direct embedded-controller access and have no profile for this
@@ -59,9 +65,9 @@ The short version: on this BIOS the obvious way to control the fans does not wor
 that does work is not documented anywhere.
 
 - The three normal thermal modes (Quiet, Balanced, Performance) are **EC-owned curves**.
-  Performance raises the curve but still idles around 2800 rpm, and it actively *drops* any
-  `Fan_Set_FullSpeed` you write. That is why every early attempt looked like a firmware
-  refusal.
+  Performance raises the curve, but it still only holds ~2800-3800 rpm until temperature
+  demands more, and it actively *drops* any `Fan_Set_FullSpeed` you write. That is why every
+  early attempt looked like a firmware refusal.
 - Fan forcing is gated behind **Custom Mode**, and the only thing that engages Custom Mode is
   `SetSmartFanMode(255)`. The documented-looking `Set_Custom_Mode_Status(1)` returns success
   and does nothing at all.
@@ -88,6 +94,24 @@ why a software curve, what the safety model has to cover — is in
 | `scripts/Legion-FanControl.ps1` | The CLI the app was ported from, and the probe tool. |
 | `docs/` | The hardware research and the app design document. |
 
+## Download
+
+Grab a zip from the
+[Releases page](https://github.com/sharof2000/legion-fan-control/releases/latest). No build
+needed.
+
+| | |
+|---|---|
+| `...-selfcontained.zip` | ~62 MB. Carries the .NET runtime inside it. **Pick this one** unless you know you already have the runtime. |
+| `...-framework.zip` | ~550 KB. Needs the [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) installed. |
+
+`SHA256SUMS.txt` ships alongside them if you want to check what you downloaded.
+
+**Windows will warn you when you run it.** The exe is unsigned, so SmartScreen shows
+*"Windows protected your PC"* the first time — click **More info → Run anyway**. That is not
+something I can fix without buying a code-signing certificate, and I would rather write it
+down here than have it be a nasty surprise on a tool that also asks for administrator rights.
+
 ## Build
 
 You need the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0). Then:
@@ -106,6 +130,17 @@ have a ~550 KB file, use `build.bat framework`.
 
 `build.bat` kills a running `LegionFanTray.exe` before it starts, because otherwise the build
 fails with a file-lock error that tells you nothing useful.
+
+The version number comes from [`appVersion.txt`](appVersion.txt) in the repo root, read by
+`Directory.Build.props`. That is the one place to edit it; the build and the CI workflows pick
+it up on their own.
+
+Every push is built on a GitHub `windows-latest` runner
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). Worth being clear about what that
+badge at the top actually means: it says the project compiles and publishes on a clean
+machine, and nothing more. A GitHub runner has no Lenovo hardware, so none of the WMI classes
+this app drives even exist there. Every functional claim on this page was checked by hand on
+the one laptop named at the top.
 
 ## Running it
 
