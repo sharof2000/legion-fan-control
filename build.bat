@@ -9,6 +9,10 @@ rem   build.bat framework    small .exe, needs the .NET 8 Desktop Runtime
 rem   build.bat clean        wipe dist\, bin\ and obj\ and stop
 rem
 rem Output lands in dist\ next to this file.
+rem
+rem The publish flags below are mirrored in .github\workflows\ -- change one and
+rem the other wants the same change. The version is not set here: it comes from
+rem appVersion.txt via Directory.Build.props, which MSBuild picks up on its own.
 rem ---------------------------------------------------------------------------
 
 set "ROOT=%~dp0"

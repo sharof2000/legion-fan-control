@@ -1,0 +1,33 @@
+<Project>
+
+  <!--
+    Applies to every project underneath this folder, automatically. There is
+    only one project today, but this is also the reason build.bat and the CI
+    workflows carry no version handling of their own.
+
+    The version itself lives in appVersion.txt so there is exactly one place to
+    edit it. Bump that file, commit, then tag it with a matching v-number. The
+    release workflow refuses to publish if the tag and the file disagree.
+
+    Read into a scratch property first: calling .Trim() directly on the result
+    of a static property function is not reliable across MSBuild versions,
+    whereas calling it on a property value always is.
+  -->
+  <PropertyGroup>
+    <_AppVersionRaw>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)appVersion.txt'))</_AppVersionRaw>
+    <Version>$(_AppVersionRaw.Trim())</Version>
+
+    <!--
+      The SDK otherwise appends the full 40-character commit SHA to the
+      informational version, so a plain local build reports
+      "0.1.0+2bb54c8d8031...". Off, so the default is a clean "0.1.0" and the
+      only thing that adds a SHA is the CI workflow, which adds a short one on
+      purpose.
+    -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <Product>Legion Fan Tray</Product>
+    <Company>Sharofiddin Fayziev</Company>
+    <Copyright>Copyright (c) 2026 Sharofiddin Fayziev</Copyright>
+  </PropertyGroup>
+
+</Project>

@@ -127,8 +127,20 @@ internal sealed class TrayApp : ApplicationContext
         var exit = new ToolStripMenuItem("Exit");
         exit.Click += (_, _) => ExitApp();
 
+        // A label, not a command. Disabled so it cannot be clicked, but it is
+        // the first thing visible on right-click -- which is where someone
+        // looks when asked "which build are you running?". The tooltip carries
+        // the commit SHA on a CI build.
+        var header = new ToolStripMenuItem(AppVersion.Title)
+        {
+            Enabled = false,
+            ToolTipText = AppVersion.Full,
+        };
+
         menu.Items.AddRange(new ToolStripItem[]
         {
+            header,
+            new ToolStripSeparator(),
             _miMax,
             _miRelease,
             new ToolStripSeparator(),

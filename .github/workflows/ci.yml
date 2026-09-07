@@ -1,0 +1,77 @@
+# Compile check for every push and pull request.
+#
+# This proves the project builds and publishes on a clean machine. It cannot
+# prove the app works: a GitHub runner has no Lenovo hardware, so none of the
+# WMI classes it drives exist there. Functional testing stays manual, on the
+# laptop named at the top of the README.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (win-x64)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # windows-latest ships a .NET SDK, but which one changes as the runner
+      # image is updated. Pinning it means an image bump cannot quietly break
+      # the build.
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore src/LegionFanTray.csproj
+
+      - name: Build
+        run: dotnet build src/LegionFanTray.csproj -c Release --no-restore
+
+      # So a binary pulled from a CI run can be traced back to a commit. The
+      # version number itself comes from appVersion.txt via
+      # Directory.Build.props -- there is nothing to pass for that.
+      - name: Stamp the commit
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $ver = (Get-Content appVersion.txt -Raw).Trim()
+          "INFO_VERSION=$ver+$sha" >> $env:GITHUB_ENV
+          Write-Host "Building $ver+$sha"
+
+      # Keep these flags in step with build.bat, which does the same publish
+      # locally.
+      - name: Publish (self-contained)
+        run: >
+          dotnet publish src/LegionFanTray.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:InformationalVersion=${{ env.INFO_VERSION }}
+          -o dist
+
+      - name: Check the exe exists and report its version
+        shell: pwsh
+        run: |
+          $exe = Get-Item dist/LegionFanTray.exe
+          "{0} -- {1:N1} MB -- v{2}" -f $exe.Name,
+            ($exe.Length / 1MB),
+            $exe.VersionInfo.ProductVersion
+
+      # 62 MB a push adds up against the 500 MB storage allowance, and nobody
+      # wants a build from two months ago. Releases are the permanent copy.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LegionFanTray-selfcontained
+          path: dist/LegionFanTray.exe
+          retention-days: 7

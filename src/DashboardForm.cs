@@ -68,7 +68,7 @@ internal sealed class DashboardForm : Form
         _controller = controller;
         _settings = settings;
 
-        Text = "Legion Fan Tray";
+        Text = AppVersion.Title;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         MinimizeBox = false;

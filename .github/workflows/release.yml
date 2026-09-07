@@ -1,0 +1,121 @@
+# Publishes a GitHub Release when a v* tag is pushed.
+#
+# The release ritual, in order:
+#   1. edit appVersion.txt
+#   2. commit it
+#   3. git tag v<that same number> && git push origin v<that same number>
+#
+# Step 1 is the one that gets forgotten, so the first job here refuses to build
+# when the tag and the file disagree. A red X and a re-tag is a much cheaper
+# mistake than a mislabelled binary sitting on the Releases page.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # required to create the release
+
+jobs:
+  release:
+    name: Publish release
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches appVersion.txt
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $file = (Get-Content appVersion.txt -Raw).Trim()
+          if ($tag -ne $file) {
+            Write-Error "Tag ${{ github.ref_name }} does not match appVersion.txt ($file). Bump the file, commit, then re-tag."
+            exit 1
+          }
+          "VERSION=$file" >> $env:GITHUB_ENV
+          Write-Host "Releasing $file"
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore src/LegionFanTray.csproj
+
+      # Two builds, into separate folders so both survive. Flags match
+      # build.bat and build.bat framework respectively.
+      - name: Publish (self-contained)
+        run: >
+          dotnet publish src/LegionFanTray.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -o dist/selfcontained
+
+      - name: Publish (framework-dependent)
+        run: >
+          dotnet publish src/LegionFanTray.csproj
+          -c Release
+          -r win-x64
+          --self-contained false
+          -p:PublishSingleFile=true
+          -o dist/framework
+
+      - name: Package
+        shell: pwsh
+        run: |
+          # Debug symbols do not belong in a drop that gets copied to another
+          # machine -- same reason build.bat deletes them.
+          Get-ChildItem dist -Recurse -Filter *.pdb | Remove-Item -Force
+
+          $v = $env:VERSION
+          New-Item -ItemType Directory -Path out | Out-Null
+
+          # Zipped rather than a bare .exe: browsers add an extra layer of
+          # warnings to a downloaded executable, and this one already triggers
+          # a UAC prompt by design.
+          Compress-Archive dist/selfcontained/* "out/LegionFanTray-$v-win-x64-selfcontained.zip"
+          Compress-Archive dist/framework/*     "out/LegionFanTray-$v-win-x64-framework.zip"
+
+          Get-ChildItem out -Filter *.zip |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content out/SHA256SUMS.txt -Encoding ascii
+
+          Get-ChildItem out | Format-Table Name, Length
+          Get-Content out/SHA256SUMS.txt
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+          body: |
+            ### Which download
+
+            | | |
+            |---|---|
+            | `...-selfcontained.zip` | ~62 MB. Carries the .NET runtime inside it. **Pick this one** unless you know you have the runtime. |
+            | `...-framework.zip` | ~550 KB. Needs the [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) already installed. |
+
+            `SHA256SUMS.txt` is there if you want to verify the download.
+
+            ### Before you run it
+
+            - **It must run as administrator.** The Lenovo WMI classes deny reads as well as
+              writes to a non-elevated process, so without it every reading shows `n/a`. You will
+              get a UAC prompt.
+            - **Windows will warn you.** The exe is unsigned, so SmartScreen shows *"Windows
+              protected your PC"* on first run — click **More info → Run anyway**. Signing it
+              needs a paid certificate.
+            - **Lenovo Legion hardware only**, and this was developed and confirmed on exactly
+              one machine: a **Legion S7-15ACH6 (82K8), BIOS HACN46WW**. Other Legion models may
+              work. Non-Lenovo hardware will not — the WMI classes simply are not there.
+            - Read the [Safety](https://github.com/${{ github.repository }}#safety) section before
+              leaving it running unattended. In Custom Mode the host owns the fans.
