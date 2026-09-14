@@ -152,7 +152,7 @@ elevation, so you get a UAC prompt rather than a mystery.
 - **Double-click the tray icon** for the dashboard: live CPU and GPU temperatures, both fan
   speeds, and the buttons.
 - **Right-click** for the quick actions: `Fans: MAX`, release, mode switching, the auto-max
-  toggle, and auto-start.
+  toggle, GPU / Power profiles and switches, and auto-start.
 - The tray icon itself draws the current CPU temperature, so you can leave the window closed.
   Turn that off in the menu if you would rather have a plain icon.
 - On Windows 11 the icon starts life hidden in the overflow flyout. Drag it out once and it
@@ -216,6 +216,43 @@ whether or not it actually changed anything.
 One trap worth knowing: **the cap is stored per power scheme**, so switching power plans
 silently drops it. The dashboard re-reads the live value every time you open it, so what you
 see is what the machine actually has.
+
+## GPU and power profiles
+
+The dashboard's **GPU / Power** tab groups the performance and battery-life controls that sit
+alongside fan control. The same profile choices and the most-used switches are available from
+the tray icon's right-click menu.
+
+Three profiles apply a coherent set of Windows power-plan values, AMD options (when an AMD
+adapter is present), and the app's per-application GPU list:
+
+| Profile | Intended result |
+|---|---|
+| `Full power` | Keeps CPU performance available, prevents Battery Saver from enabling itself, keeps the PCIe link awake on battery, removes frame caps, and sends listed apps to the NVIDIA GPU. |
+| `Balanced` | Restores the vendor-style defaults: normal CPU management, moderate PCIe power saving, no frame cap, and no app GPU overrides. |
+| `Power save` | Caps CPU to 80% on battery, uses stronger PCIe power saving, enables a 30 FPS cap and AMD power-saving features, and sends listed apps to the Radeon iGPU. |
+
+Before applying the first profile, the app captures the relevant values. **Restore original**
+puts that snapshot back; it is the state from before this app first changed these controls, not
+the state before the most recent profile. Individual switches are also reversible: they save
+their previous power-plan value before changing it and restore that value when turned off.
+
+The per-app GPU list is the same Windows graphics preference used by **Settings → System →
+Display → Graphics**. Add an executable and choose either the power-saving Radeon iGPU or the
+high-performance NVIDIA dGPU; remove its override to return to *Let Windows decide*. These
+preferences are per Windows account. If UAC is answered using a different administrator
+account, the override is written for that account instead.
+
+On AMD systems, the tab can read and change global Radeon driver options: Frame Rate Target
+Control (FRTC), Radeon Chill, Radeon Boost, Vari-Bright, and AMD Software's Power Saver
+auto-enable setting. Changes apply when the affected application next starts, and opening AMD
+Software can rewrite them, so the app reads them back on refresh. Per-app AMD profiles are not
+supported because their database is undocumented.
+
+NVIDIA Battery Boost, Max Frame Rate, and Whisper Mode are intentionally not changed by this
+app. They live in NVIDIA's undocumented binary profile database; use the NVIDIA app instead.
+When on battery, the dashboard warns that Battery Boost may be capping the dGPU (commonly at
+30 FPS) and provides a shortcut to the vendor app.
 
 ## The PowerShell tool
 

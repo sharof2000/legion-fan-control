@@ -32,6 +32,18 @@ internal enum ViewMode
     Numbers,
 }
 
+/// <summary>
+/// One entry in the per-app GPU override list. Generic on purpose: a full path
+/// to any executable, and which GPU Windows should hand it.
+/// </summary>
+internal sealed class GpuOverride
+{
+    public string Path { get; set; } = "";
+
+    /// <summary>1 = power saving (iGPU), 2 = high performance (dGPU).</summary>
+    public int Preference { get; set; } = GpuPreference.PowerSaving;
+}
+
 internal sealed class Settings
 {
     [JsonConverter(typeof(JsonStringEnumConverter))]
@@ -69,6 +81,39 @@ internal sealed class Settings
 
     /// <summary>Seconds to wait for the EC to react before judging a write.</summary>
     public int SettleSeconds { get; set; } = 6;
+
+    // --- GPU / Power tab ----------------------------------------------------
+
+    /// <summary>Pin PROCTHROTTLEMIN and PROCTHROTTLEMAX to 100 on both rails.</summary>
+    public bool LockCpuBothRails { get; set; }
+
+    /// <summary>Battery Saver threshold to 0, so it never turns itself on.</summary>
+    public bool DisableBatterySaverAuto { get; set; }
+
+    /// <summary>PCIe ASPM off on the battery rail.</summary>
+    public bool KeepPcieFullPower { get; set; }
+
+    /// <summary>
+    /// Whatever each powercfg rail held before a switch was turned on, keyed
+    /// "SUB/SETTING/RAIL". A dictionary rather than a field per setting so that
+    /// adding a switch row costs nothing here, and so settings.json stays
+    /// readable. Turning a switch off restores from this; an absent key means
+    /// nothing was captured and the switch refuses rather than guessing.
+    /// </summary>
+    public Dictionary<string, int> SavedPowerValues { get; set; } = new();
+
+    /// <summary>Master switch for the per-app GPU override list.</summary>
+    public bool GpuOverridesEnabled { get; set; }
+
+    public List<GpuOverride> GpuOverrides { get; set; } = new();
+
+    /// <summary>
+    /// How the machine looked before any profile button was ever pressed.
+    /// Captured once and never overwritten, so "Restore original" always means
+    /// the state the laptop was in before this app started rearranging it --
+    /// not the state before the most recent profile.
+    /// </summary>
+    public MachineSnapshot? OriginalState { get; set; }
 
     [JsonIgnore]
     public string? LoadWarning { get; private set; }
@@ -121,6 +166,13 @@ internal sealed class Settings
         ExitSamples = Math.Clamp(ExitSamples, 1, 60);
         PollIntervalMs = Math.Clamp(PollIntervalMs, 500, 30000);
         SettleSeconds = Math.Clamp(SettleSeconds, 2, 30);
+
+        // A blank path would write a nameless registry value that no UI can
+        // then remove; a preference outside {1,2} is not a thing Windows reads.
+        GpuOverrides.RemoveAll(o => string.IsNullOrWhiteSpace(o.Path));
+        foreach (var o in GpuOverrides)
+            if (o.Preference != GpuPreference.PowerSaving && o.Preference != GpuPreference.HighPerf)
+                o.Preference = GpuPreference.PowerSaving;
     }
 
     /// <summary>
@@ -145,3 +197,4 @@ internal sealed class Settings
         catch { /* a failed save must not take the app down */ }
     }
 }
+

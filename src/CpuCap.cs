@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Text.RegularExpressions;
 
 namespace LegionFanTray;
 
@@ -33,7 +32,7 @@ internal static class Shell
 
 /// <summary>
 /// CPU max processor state via powercfg -- a direct port of Set-CpuCap /
-/// Reset-CpuCap in scripts/Legion-FanControl.ps1.
+/// Reset-CpuCap in Legion-FanControl.ps1.
 ///
 /// This is heat control at the source rather than fan control: 99% disables
 /// Turbo, the main thermal driver on the 5800H. It complements fan forcing
@@ -49,21 +48,11 @@ internal static class CpuCap
 
     private const string SettingPath = "SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX";
 
-    /// <summary>Current cap on the active scheme, as (AC, DC) percentages.</summary>
-    public static (int? Ac, int? Dc) Read()
-    {
-        var r = Shell.Run("powercfg.exe", "/query " + SettingPath);
-        if (r.ExitCode != 0) return (null, null);
-        return (Extract(r.Output, "AC"), Extract(r.Output, "DC"));
-    }
-
-    private static int? Extract(string text, string rail)
-    {
-        var m = Regex.Match(text, "Current " + rail + @" Power Setting Index:\s*(0x[0-9a-fA-F]+)");
-        if (!m.Success) return null;
-        try { return Convert.ToInt32(m.Groups[1].Value, 16); }
-        catch { return null; }
-    }
+    /// <summary>
+    /// Current cap on the active scheme, as (AC, DC) percentages. The powercfg
+    /// query and its parser live in PowerPlan so there is one of each.
+    /// </summary>
+    public static (int? Ac, int? Dc) Read() => PowerPlan.Read(PowerPlan.ProcThrottleMax);
 
     /// <summary>
     /// Applies to both AC and DC on the active scheme, then verifies by
@@ -104,3 +93,4 @@ internal static class CpuCap
         return line?.Trim() ?? "no output";
     }
 }
+

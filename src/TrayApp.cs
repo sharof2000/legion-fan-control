@@ -28,6 +28,16 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem _miAutoStartSilent = new("Start without UAC prompt");
     private readonly ToolStripMenuItem _miShowTemp = new("Show temperature in tray icon");
 
+    // GPU / Power tab mirrored into the tray, so the levers you flip around a
+    // charger move do not need the dashboard open.
+    private readonly ToolStripMenuItem _miLockCpu = new(PowerPlan.LockCpuBothRails.Caption);
+    private readonly ToolStripMenuItem _miNoBatterySaver = new(PowerPlan.NeverAutoBatterySaver.Caption);
+    private readonly ToolStripMenuItem _miPcieFull = new(PowerPlan.PcieFullPowerOnBattery.Caption);
+    private readonly ToolStripMenuItem _miGpuOverrides = new("Apply per-app GPU overrides");
+    private readonly ToolStripMenuItem[] _miProfiles =
+        PowerProfile.All.Select(p => new ToolStripMenuItem(p.Name)).ToArray();
+    private readonly ToolStripMenuItem _miRestoreOriginal = new("Restore original");
+
     // Never disposed: it lives for the process lifetime and is used on every
     // icon repaint. Segoe UI with a fallback for the rare machine without it.
     private static readonly FontFamily IconFamily = LoadIconFamily();
@@ -51,6 +61,15 @@ internal sealed class TrayApp : ApplicationContext
         _dashboard.AutoMaxChanged += () =>
         {
             _miAutoMax.Checked = _settings.AutoMaxEnabled;
+        };
+
+        // The window works out which profile is in force by reading the machine.
+        // Ticking the same item here means the two never disagree, and saves
+        // doing that read twice.
+        _dashboard.ActiveProfileChanged += active =>
+        {
+            for (int i = 0; i < _miProfiles.Length; i++)
+                _miProfiles[i].Checked = ReferenceEquals(PowerProfile.All[i], active);
         };
 
         _icon = new NotifyIcon
@@ -121,31 +140,49 @@ internal sealed class TrayApp : ApplicationContext
             if (_controller.Latest != null) UpdateIcon(_controller.Latest);
         };
 
+        _miLockCpu.Click += (_, _) => TogglePowerAsync(
+            PowerPlan.LockCpuBothRails, () => _settings.LockCpuBothRails, v => _settings.LockCpuBothRails = v, _miLockCpu);
+        _miNoBatterySaver.Click += (_, _) => TogglePowerAsync(
+            PowerPlan.NeverAutoBatterySaver, () => _settings.DisableBatterySaverAuto, v => _settings.DisableBatterySaverAuto = v, _miNoBatterySaver);
+        _miPcieFull.Click += (_, _) => TogglePowerAsync(
+            PowerPlan.PcieFullPowerOnBattery, () => _settings.KeepPcieFullPower, v => _settings.KeepPcieFullPower = v, _miPcieFull);
+        _miGpuOverrides.Click += (_, _) => ToggleGpuOverridesAsync();
+
+        for (int i = 0; i < _miProfiles.Length; i++)
+        {
+            int index = i;
+            _miProfiles[i].Click += (_, _) => ApplyProfileAsync(index);
+            _miProfiles[i].ToolTipText = PowerProfile.All[i].Tooltip;
+        }
+        _miRestoreOriginal.Click += (_, _) => RestoreOriginalAsync();
+
+        var powerMenu = new ToolStripMenuItem("GPU / Power");
+        powerMenu.DropDownItems.AddRange(_miProfiles);
+        powerMenu.DropDownItems.AddRange(new ToolStripItem[]
+        {
+            _miRestoreOriginal,
+            new ToolStripSeparator(),
+            _miLockCpu,
+            _miNoBatterySaver,
+            _miPcieFull,
+            new ToolStripSeparator(),
+            _miGpuOverrides,
+        });
+
         var open = new ToolStripMenuItem("Open dashboard");
         open.Click += (_, _) => ShowDashboard();
 
         var exit = new ToolStripMenuItem("Exit");
         exit.Click += (_, _) => ExitApp();
 
-        // A label, not a command. Disabled so it cannot be clicked, but it is
-        // the first thing visible on right-click -- which is where someone
-        // looks when asked "which build are you running?". The tooltip carries
-        // the commit SHA on a CI build.
-        var header = new ToolStripMenuItem(AppVersion.Title)
-        {
-            Enabled = false,
-            ToolTipText = AppVersion.Full,
-        };
-
         menu.Items.AddRange(new ToolStripItem[]
         {
-            header,
-            new ToolStripSeparator(),
             _miMax,
             _miRelease,
             new ToolStripSeparator(),
             modeMenu,
             _miAutoMax,
+            powerMenu,
             new ToolStripSeparator(),
             _miSuspendVantage,
             _miAutoStart,
@@ -165,6 +202,15 @@ internal sealed class TrayApp : ApplicationContext
         _miSuspendVantage.Checked = _settings.SuspendVantage;
         _miShowTemp.Checked = _settings.ShowTempInTrayIcon;
 
+        // These flags are corrected against powercfg whenever the dashboard
+        // refreshes, so the menu follows the machine rather than a stale file.
+        _miLockCpu.Checked = _settings.LockCpuBothRails;
+        _miNoBatterySaver.Checked = _settings.DisableBatterySaverAuto;
+        _miPcieFull.Checked = _settings.KeepPcieFullPower;
+        _miGpuOverrides.Checked = _settings.GpuOverridesEnabled;
+        _miGpuOverrides.Enabled = _settings.GpuOverrides.Count > 0;
+        _miRestoreOriginal.Enabled = _settings.OriginalState is not null;
+
         // Read the real state of the scheduled task rather than trusting
         // settings.json, which can drift if the task is removed elsewhere.
         bool registered = AutoStart.IsRegistered();
@@ -173,6 +219,120 @@ internal sealed class TrayApp : ApplicationContext
         _miAutoStart.Checked = _settings.AutoStart;
         _miAutoStartSilent.Checked = _settings.AutoStartSilent;
         _miAutoStartSilent.Enabled = _settings.AutoStart;
+    }
+
+    /// <summary>
+    /// A profile is a dozen powercfg and registry writes, so it runs off the UI
+    /// thread like the individual switches do. The whole submenu is disabled
+    /// meanwhile: a profile racing a switch would leave neither in force.
+    /// </summary>
+    private async void ApplyProfileAsync(int index)
+    {
+        var profile = PowerProfile.All[index];
+        SetProfileItemsEnabled(false);
+        try
+        {
+            var r = await Task.Run(() =>
+            {
+                _settings.OriginalState ??= MachineSnapshot.Capture(_settings);
+                return profile.Apply(_settings);
+            });
+
+            // Saved either way: a profile that failed halfway still moved
+            // settings, and the snapshot it captured is the only record.
+            _settings.Save();
+            Balloon(profile.Name, r.Message, r.Ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+        }
+        finally
+        {
+            SetProfileItemsEnabled(true);
+        }
+
+        SyncMenuFromSettings();
+        _dashboard.RefreshEverything();
+    }
+
+    private async void RestoreOriginalAsync()
+    {
+        var snapshot = _settings.OriginalState;
+        if (snapshot is null) return;
+
+        SetProfileItemsEnabled(false);
+        try
+        {
+            var r = await Task.Run(() => snapshot.Restore(_settings));
+            _settings.Save();
+            Balloon("Restore original", r.Message, r.Ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+        }
+        finally
+        {
+            SetProfileItemsEnabled(true);
+        }
+
+        SyncMenuFromSettings();
+        _dashboard.RefreshEverything();
+    }
+
+    private void SetProfileItemsEnabled(bool enabled)
+    {
+        foreach (var mi in _miProfiles) mi.Enabled = enabled;
+        _miRestoreOriginal.Enabled = enabled && _settings.OriginalState is not null;
+    }
+
+    /// <summary>
+    /// powercfg is slow enough to freeze the menu, so the write runs off the UI
+    /// thread. The item is disabled meanwhile: two writes to the same setting
+    /// racing each other would leave the captured "before" values wrong.
+    /// </summary>
+    private async void TogglePowerAsync(PowerToggle toggle, Func<bool> get, Action<bool> set, ToolStripMenuItem item)
+    {
+        bool want = !get();
+        item.Enabled = false;
+        try
+        {
+            var r = await Task.Run(() => want ? PowerPlan.Engage(toggle, _settings) : PowerPlan.Release(toggle, _settings));
+
+            // Save either way: a partial engage has still captured the original
+            // values, and losing those would strand the machine.
+            if (r.Ok) set(want);
+            _settings.Save();
+            if (!r.Ok) Balloon(toggle.Caption, r.Message, ToolTipIcon.Warning);
+        }
+        finally
+        {
+            item.Enabled = true;
+        }
+
+        SyncMenuFromSettings();
+        _dashboard.RefreshPowerState();
+    }
+
+    private async void ToggleGpuOverridesAsync()
+    {
+        bool want = !_settings.GpuOverridesEnabled;
+        _miGpuOverrides.Enabled = false;
+        try
+        {
+            var r = await Task.Run(() => want
+                ? GpuPreference.ApplyAll(_settings.GpuOverrides)
+                : GpuPreference.ClearAll(_settings.GpuOverrides));
+            if (r.Ok)
+            {
+                _settings.GpuOverridesEnabled = want;
+                _settings.Save();
+            }
+            else
+            {
+                Balloon("Per-app GPU override", r.Message, ToolTipIcon.Warning);
+            }
+        }
+        finally
+        {
+            _miGpuOverrides.Enabled = true;
+        }
+
+        SyncMenuFromSettings();
+        _dashboard.RefreshPowerState();
     }
 
     private void ToggleAutoStart()
@@ -448,3 +608,4 @@ internal sealed class TrayApp : ApplicationContext
         base.Dispose(disposing);
     }
 }
+
