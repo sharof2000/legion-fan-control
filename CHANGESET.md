@@ -1,6 +1,7 @@
 # Changeset: GPU and power controls
 
 **Release type:** minor
+**Tag:** 0.1.1
 
 ## Added
 
