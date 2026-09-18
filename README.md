@@ -159,7 +159,9 @@ elevation, so you get a UAC prompt rather than a mystery.
   stays next to the clock.
 
 Custom Mode and Performance are AC-gated by the firmware, so fan forcing does nothing on
-battery. That is the laptop's rule, not the app's.
+battery. That is the laptop's rule, not the app's. A low-wattage charger counts as AC even
+when it cannot keep up and the battery is still draining; the status line shows
+`AC (low-power charger)` in that case.
 
 ## Safety
 
@@ -195,7 +197,16 @@ cycle every few seconds, which is audibly worse than either state on its own. Th
 deadband, plus requiring more consecutive samples to release (5) than to engage (3), is what
 stops that.
 
-It runs on AC only, it is off by default, and it never releases fans that you pinned by hand.
+It runs whenever a charger is connected, including a low-wattage one, and never on battery
+alone. It is off by default, and it never releases fans that you pinned by hand. Once it has
+engaged, the release side keeps running whatever the power reading says, so unplugging or a
+flaky charger cannot leave the fans stuck at full speed; turning auto-max off while it holds
+the fans releases them.
+
+If constant `FANS MAX` is too loud, this is the quieter option. A fixed middle speed such as
+3000 rpm is not possible on this BIOS: with no usable fan table, full speed on or off is all
+the firmware accepts, and faking a middle speed by toggling would make the fans ramp up and
+down constantly.
 
 ## CPU cap
 
@@ -263,17 +274,18 @@ The subcommands, in full:
 | `monitor` | Live read-only dashboard: CPU/GPU temp, both fan RPMs, current mode. |
 | `probe` | Read-only capability dump of every Lenovo WMI class. Start here on a new machine. |
 | `custom max` | Engage Custom Mode and pin both fans at 4300 rpm. |
-| `custom off` | Release, back to Balanced. Also `custom status`, `custom on`, `custom fullspeed <on\|off>`. |
+| `custom off` | Release, back to the mode that was active before. Also `custom status`, `custom on`, `custom fullspeed <on\|off>`. |
 | `mode <q\|b\|p>` | Set Quiet / Balanced / Performance, verified by reading `ThermalMode` back. |
 | `force` | Attempt `Fan_Set_FullSpeed` on its own, then verify by RPM readback. |
 | `cap <percent>` | Cap CPU max processor state via `powercfg`. `uncap` restores 100%. |
+| `test <name>` | Experiments: `power`, `methods` (read-only), `modes`, `custom`, `pulse`, `table`. Each logs rpm to `test-*.csv` and restores the starting mode. See Round 3 in [`docs/findings.md`](docs/findings.md). |
 | `help` | Usage. The default when you give it nothing. |
 
 ```powershell
 .\scripts\Legion-FanControl.ps1 monitor     # watch it live
 .\scripts\Legion-FanControl.ps1 probe       # what does my firmware expose?
 .\scripts\Legion-FanControl.ps1 custom max  # fans to 4300 rpm
-.\scripts\Legion-FanControl.ps1 custom off  # release, back to Balanced
+.\scripts\Legion-FanControl.ps1 custom off  # release, back to the previous mode
 ```
 
 Everything except `help` needs an elevated terminal, for the same read-access reason as the
