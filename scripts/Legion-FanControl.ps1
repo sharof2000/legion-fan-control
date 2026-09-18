@@ -10,7 +10,7 @@
     HOW TO ACTUALLY SPIN THE FANS (confirmed 2026-08-24, HACN46WW):
 
         .\Legion-FanControl.ps1 custom max     # 2800 -> 4300 rpm, both fans
-        .\Legion-FanControl.ps1 custom off     # release, back to Balanced
+        .\Legion-FanControl.ps1 custom off     # release, back to the previous mode
 
       Modes 1/2/3 are EC-owned curves. Performance raises the curve but
       still idles ~2800 rpm and DROPS Fan_Set_FullSpeed — which is why
@@ -51,7 +51,7 @@
 .EXAMPLE
     # Run from an ELEVATED terminal, on AC power:
     .\Legion-FanControl.ps1 custom max               # fans to 4300 rpm
-    .\Legion-FanControl.ps1 custom off               # restore Balanced
+    .\Legion-FanControl.ps1 custom off               # restore the previous mode
 
 .EXAMPLE
     # Prove whether Lenovo Vantage is reverting the writes:
@@ -71,7 +71,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('monitor', 'probe', 'cap', 'uncap', 'force', 'mode', 'custom', 'help')]
+    [ValidateSet('monitor', 'probe', 'cap', 'uncap', 'force', 'mode', 'custom', 'test', 'help')]
     [string]$Command = 'help',
 
     # Positional arg for `cap <percent>`, `force <on|off>`,
@@ -85,6 +85,19 @@ param(
 
     # Refresh interval for `monitor`.
     [int]$IntervalSeconds = 2,
+
+    # `test` timings: seconds per phase, total pulse duration, pulse on/off,
+    # and the CPU temperature that aborts any write test.
+    [int]$HoldSeconds = 30,
+    [int]$DurationSeconds = 60,
+    [int]$OnSeconds = 3,
+    [int]$OffSeconds = 5,
+    [int]$MaxTempC = 90,
+
+    # `test table`: flat fan level (0-10 scale, clamped to 3-10) and byte 0 of
+    # the Fan_Set_Table buffer (1 as LenovoLegionToolkit writes, or 255).
+    [int]$Level = 5,
+    [int]$TableMode = 1,
 
     # Temporarily stop Lenovo Vantage / ImController around the write, then
     # restore them. Used to prove whether Vantage is reverting host writes.
@@ -101,6 +114,10 @@ $OtherMethodClass = 'LENOVO_OTHER_METHOD'
 
 # Custom Mode sentinel used by SetSmartFanMode on 2021 Legion firmware.
 $CustomModeValue = 255
+
+# Stock mode active before 'custom on/max', so 'custom off' can return to it.
+# A low-wattage charger locks the EC to Quiet; asking for Balanced is refused.
+$ModeBeforeFile = Join-Path $env:LOCALAPPDATA 'LegionFanTray\script-mode-before.txt'
 
 $ModeNames = @{
     1   = 'Quiet'
@@ -245,13 +262,22 @@ function Get-FanTable {
     }
 }
 
-# Returns $true if running on AC power, $false on battery, $null if unknown.
-# Win32_Battery.BatteryStatus: 2 = AC connected, 1 = discharging.
+# Returns $true if a charger is connected, $false on battery, $null if unknown.
+# Asks Windows for the AC line status first: a weak charger that cannot keep up
+# leaves Win32_Battery at 1 (discharging) while still plugged in.
+# Fallback BatteryStatus: 2 = AC, 3 = fully charged, 6-9 = charging.
 function Get-OnAcPower {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        switch ([string][System.Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus) {
+            'Online'  { return $true }
+            'Offline' { return $false }
+        }
+    } catch { }
     try {
         $b = Get-CimInstance Win32_Battery -ErrorAction Stop | Select-Object -First 1
         if ($null -eq $b) { return $true }  # desktop / no battery => effectively AC
-        return ($b.BatteryStatus -eq 2)
+        return ([int]$b.BatteryStatus -in 2, 3, 6, 7, 8, 9)
     } catch { $null }
 }
 
@@ -943,6 +969,13 @@ function Enter-CustomMode {
 
     Write-Host ("   Mode before: {0}" -f (Format-Mode $modeBefore)) -ForegroundColor DarkGray
 
+    if ($null -ne $modeBefore -and [int]$modeBefore -in 1, 2, 3) {
+        try {
+            $null = New-Item -ItemType Directory -Force -Path (Split-Path $ModeBeforeFile)
+            Set-Content -Path $ModeBeforeFile -Value ([int]$modeBefore)
+        } catch { }
+    }
+
     if (Test-CustomModeEngaged) {
         Write-Host "  [OK] Already in Custom Mode." -ForegroundColor Green
         return $true
@@ -1013,8 +1046,16 @@ function Enter-CustomMode {
 }
 
 function Exit-CustomMode {
+    $target = 2
+    try {
+        if (Test-Path $ModeBeforeFile) {
+            $saved = [int](Get-Content $ModeBeforeFile -TotalCount 1)
+            if ($saved -in 1, 2, 3) { $target = $saved }
+        }
+    } catch { }
+
     Write-Host ""
-    Write-Host "  [WRITE] Leaving Custom Mode -> Balanced (2)" -ForegroundColor Yellow
+    Write-Host ("  [WRITE] Leaving Custom Mode -> {0}" -f (Format-Mode $target)) -ForegroundColor Yellow
 
     # Release full speed first, so the EC isn't handed a stale override.
     try {
@@ -1032,9 +1073,9 @@ function Exit-CustomMode {
     }
 
     try {
-        $null = Get-GamezoneInstance | Invoke-CimMethod -MethodName SetSmartFanMode -Arguments @{ Data = [uint32]2 }
+        $null = Get-GamezoneInstance | Invoke-CimMethod -MethodName SetSmartFanMode -Arguments @{ Data = [uint32]$target }
     } catch {
-        Write-Host "   SetSmartFanMode(2) threw: $($_.Exception.Message.Trim())" -ForegroundColor Red
+        Write-Host "   SetSmartFanMode($target) threw: $($_.Exception.Message.Trim())" -ForegroundColor Red
     }
 
     Start-Sleep -Seconds 2
@@ -1045,10 +1086,17 @@ function Exit-CustomMode {
     Write-Host ("   ThermalMode  : {0}" -f (Format-Mode $thermal))
     Write-Host ""
 
-    if ([int]$thermal -eq 2 -or [int]$smart -eq 2) {
-        Write-Host "  [OK] Back on the firmware's own curve (Balanced)." -ForegroundColor Green
+    # Out of Custom is what matters. The EC may pick a different stock mode
+    # than asked for: a low-wattage charger locks Quiet.
+    if ($null -ne $smart -and [int]$smart -eq $target) {
+        Write-Host ("  [OK] Back on the firmware's own curve ({0})." -f $ModeNames[$target]) -ForegroundColor Green
+        Remove-Item $ModeBeforeFile -ErrorAction SilentlyContinue
+    } elseif ($null -ne $smart -and [int]$smart -in 1, 2, 3) {
+        Write-Host ("  [OK] Out of Custom Mode. Asked for {0}, the firmware kept {1}" -f $ModeNames[$target], $ModeNames[[int]$smart]) -ForegroundColor Yellow
+        Write-Host "       (a low-wattage charger locks Quiet)." -ForegroundColor Yellow
+        Remove-Item $ModeBeforeFile -ErrorAction SilentlyContinue
     } else {
-        Write-Host "  [!] Mode did not return to Balanced. Re-run, or set it from Vantage." -ForegroundColor Red
+        Write-Host ("  [!] Still in Custom Mode (SmartFanMode {0}). Re-run, or set a mode from Vantage." -f (Format-Mode $smart)) -ForegroundColor Red
     }
     Write-Host ""
 }
@@ -1268,7 +1316,7 @@ function Invoke-Custom {
                 Write-Host "  Next:" -ForegroundColor Cyan
                 Write-Host "    .\Legion-FanControl.ps1 custom fullspeed on   # pin fans at max" -ForegroundColor Cyan
                 Write-Host "    .\Legion-FanControl.ps1 custom curve dump     # inspect the curve" -ForegroundColor Cyan
-                Write-Host "    .\Legion-FanControl.ps1 custom off            # restore Balanced" -ForegroundColor Cyan
+                Write-Host "    .\Legion-FanControl.ps1 custom off            # restore the previous mode" -ForegroundColor Cyan
                 Write-Host ""
             }
             elseif (-not $SuspendVantage.IsPresent) {
@@ -1380,6 +1428,405 @@ function Invoke-Custom {
 }
 
 # =============================================================================
+# Subcommand: test  (experiments for a middle fan speed on DC / weak chargers)
+#
+#   power / methods are READ-ONLY. modes / custom / pulse WRITE, and always
+#   restore the starting mode in a finally block (Ctrl+C included). They
+#   refuse to run while the tray app is running: two writers on the same
+#   firmware fight each other. Each run saves test-<name>-<stamp>.csv here.
+# =============================================================================
+
+function Get-TestSample {
+    param([string]$Phase)
+    [pscustomobject]@{
+        Time      = (Get-Date -Format 'HH:mm:ss')
+        Phase     = $Phase
+        Smart     = Get-SmartFanMode
+        Thermal   = Get-ThermalMode
+        FullSpeed = Get-FullSpeedStatus
+        Fan0      = Get-FanRpm -FanId 0
+        Fan1      = Get-FanRpm -FanId 1
+        CpuC      = Get-SensorTemp -SensorId 3
+        GpuC      = Get-SensorTemp -SensorId 4
+        OnAc      = Get-OnAcPower
+    }
+}
+
+function Write-TestSample {
+    param($S)
+    Write-Host ("   {0}  {1,-14} smart {2,-3} thermal {3,-3} full {4,-5}  fan0 {5,5}  fan1 {6,5}  cpu {7,3}C  gpu {8,3}C" -f `
+        $S.Time, $S.Phase, (Format-Reading $S.Smart ''), (Format-Reading $S.Thermal ''), (Format-Reading $S.FullSpeed ''), `
+        (Format-Reading $S.Fan0 ''), (Format-Reading $S.Fan1 ''), (Format-Reading $S.CpuC ''), (Format-Reading $S.GpuC ''))
+}
+
+# Sample every $StepSeconds for $Seconds, printing as it goes. Throws if the
+# CPU crosses -MaxTempC so the caller's finally block can take over.
+function Watch-TestPhase {
+    param([string]$Phase, [int]$Seconds, [int]$StepSeconds = 2)
+    $out = @()
+    $end = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $end) {
+        $s = Get-TestSample -Phase $Phase
+        Write-TestSample $s
+        $out += $s
+        if ($null -ne $s.CpuC -and $s.CpuC -ge $MaxTempC) {
+            throw "CPU reached $($s.CpuC) C (limit $MaxTempC C). Test aborted."
+        }
+        Start-Sleep -Seconds $StepSeconds
+    }
+    return , $out
+}
+
+function Write-TestSummary {
+    param($Samples)
+    Write-Host ""
+    Write-Host "   SUMMARY (rpm)" -ForegroundColor White
+    Write-Host ("   {0,-16} {1,6} {2,6} {3,6}   {4,6} {5,6} {6,6}   {7}" -f 'phase', 'f0 min', 'f0 avg', 'f0 max', 'f1 min', 'f1 avg', 'f1 max', 'modes seen (smart/thermal)') -ForegroundColor DarkGray
+    foreach ($g in ($Samples | Group-Object Phase)) {
+        $f0 = $g.Group | Where-Object { $null -ne $_.Fan0 } | Measure-Object Fan0 -Minimum -Maximum -Average
+        $f1 = $g.Group | Where-Object { $null -ne $_.Fan1 } | Measure-Object Fan1 -Minimum -Maximum -Average
+        $modes = ($g.Group | ForEach-Object { "$($_.Smart)/$($_.Thermal)" } | Select-Object -Unique) -join ', '
+        Write-Host ("   {0,-16} {1,6} {2,6:N0} {3,6}   {4,6} {5,6:N0} {6,6}   {7}" -f `
+            $g.Name, $f0.Minimum, $f0.Average, $f0.Maximum, $f1.Minimum, $f1.Average, $f1.Maximum, $modes)
+    }
+}
+
+function Save-TestLog {
+    param([string]$Name, $Samples)
+    if (-not $Samples -or $Samples.Count -eq 0) { return }
+    $file = Join-Path $PSScriptRoot ("test-{0}-{1}.csv" -f $Name, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    try {
+        $Samples | Export-Csv -Path $file -NoTypeInformation -Encoding UTF8
+        Write-Host ""
+        Write-Host "  [SAVED] $file" -ForegroundColor Green
+    } catch {
+        Write-Host "  [!] Could not write $file : $($_.Exception.Message.Trim())" -ForegroundColor Yellow
+    }
+}
+
+function Assert-NoTrayApp {
+    if (Get-Process -Name 'LegionFanTray' -ErrorAction SilentlyContinue) {
+        Write-Host ""
+        Write-Host "  [!] LegionFanTray.exe is running. Exit it from the tray first -" -ForegroundColor Yellow
+        Write-Host "      two writers on the same firmware will fight each other." -ForegroundColor Yellow
+        Write-Host ""
+        return $false
+    }
+    return $true
+}
+
+function Set-TestMode {
+    param([int]$Mode)
+    $null = Get-GamezoneInstance | Invoke-CimMethod -MethodName SetSmartFanMode -Arguments @{ Data = [uint32]$Mode }
+}
+
+function Set-TestFullSpeed {
+    param([bool]$On)
+    $null = Get-FanMethodInstance | Invoke-CimMethod -MethodName Fan_Set_FullSpeed -Arguments @{ Status = $On }
+}
+
+# Put the machine back where the test found it. Custom / unknown -> Balanced.
+function Restore-TestState {
+    param($ModeBefore)
+    $target = 2
+    if ($null -ne $ModeBefore -and [int]$ModeBefore -in 1, 2, 3) { $target = [int]$ModeBefore }
+    try { Set-TestFullSpeed -On $false } catch { }
+    try { Set-TestMode -Mode $target } catch { }
+    Start-Sleep -Seconds 2
+    Write-Host ""
+    Write-Host ("  [RESTORED] SmartFanMode {0}, ThermalMode {1}, FullSpeed {2}" -f `
+        (Format-Mode (Get-SmartFanMode)), (Format-Mode (Get-ThermalMode)), (Format-Reading (Get-FullSpeedStatus) '')) -ForegroundColor Cyan
+}
+
+function Invoke-TestPower {
+    Write-Host ""
+    Write-Host "  Power source (read-only)" -ForegroundColor Cyan
+    Write-Host "  ------------------------" -ForegroundColor DarkGray
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $ps = [System.Windows.Forms.SystemInformation]::PowerStatus
+        Write-Host ("   ACLineStatus (Windows)  : {0}" -f $ps.PowerLineStatus)
+        Write-Host ("   Charge status / percent : {0} / {1:P0}" -f $ps.BatteryChargeStatus, $ps.BatteryLifePercent)
+    } catch { Write-Host "   ACLineStatus            : n/a ($($_.Exception.Message.Trim()))" }
+
+    try {
+        foreach ($b in @(Get-CimInstance Win32_Battery -ErrorAction Stop)) {
+            $meaning = switch ([int]$b.BatteryStatus) {
+                1 { 'discharging' } 2 { 'on AC' } 3 { 'fully charged' }
+                6 { 'charging' } 7 { 'charging (high)' } 8 { 'charging (low)' } 9 { 'charging (critical)' }
+                default { 'other' }
+            }
+            Write-Host ("   Win32_Battery status    : {0} ({1}), {2}%" -f $b.BatteryStatus, $meaning, $b.EstimatedChargeRemaining)
+        }
+    } catch { Write-Host "   Win32_Battery           : n/a" }
+
+    try {
+        foreach ($b in @(Get-CimInstance -Namespace $WmiNamespace -ClassName BatteryStatus -ErrorAction Stop)) {
+            Write-Host ("   PowerOnline / Charging / Discharging : {0} / {1} / {2}" -f $b.PowerOnline, $b.Charging, $b.Discharging)
+            Write-Host ("   ChargeRate / DischargeRate           : {0} mW / {1} mW" -f $b.ChargeRate, $b.DischargeRate)
+        }
+    } catch { Write-Host "   root\WMI BatteryStatus  : n/a (needs admin)" }
+
+    Write-Host ""
+    Write-Host ("   => Get-OnAcPower verdict : {0}" -f (Get-OnAcPower)) -ForegroundColor White
+    Write-Host "      A weak charger shows PowerOnline True with a DischargeRate above 0." -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+function Invoke-TestMethods {
+    Write-Host ""
+    Write-Host "  Every LENOVO_* WMI method and its parameters (read-only)" -ForegroundColor Cyan
+    Write-Host "  Highlighted: names that could set a speed, level or curve." -ForegroundColor DarkGray
+    $pattern = 'Speed|Level|Cooling|Feature|Curve|Table|Fan|Duty|PWM|RPM'
+    $known = 'Fan_Set_FullSpeed|Fan_Set_Table|SetSmartFanMode|Set_Custom_Mode_Status'
+    try {
+        $classes = @(Get-CimClass -Namespace $WmiNamespace -ErrorAction Stop |
+            Where-Object { $_.CimClassName -like 'LENOVO_*' } | Sort-Object CimClassName)
+    } catch {
+        Write-Host "  [x] Cannot enumerate $WmiNamespace : $($_.Exception.Message.Trim())" -ForegroundColor Red
+        return
+    }
+    foreach ($c in $classes) {
+        if (@($c.CimClassMethods).Count -eq 0) { continue }
+        Write-Host ""
+        Write-Host ("  [{0}]" -f $c.CimClassName) -ForegroundColor White
+        foreach ($m in $c.CimClassMethods) {
+            $in  = @($m.Parameters | Where-Object { $_.Qualifiers.Name -contains 'In' }  | ForEach-Object { "$($_.Name):$($_.CimType)" }) -join ', '
+            $out = @($m.Parameters | Where-Object { $_.Qualifiers.Name -contains 'Out' } | ForEach-Object { "$($_.Name):$($_.CimType)" }) -join ', '
+            $color = if ($m.Name -match $known) { 'DarkGray' }
+                     elseif ($m.Name -match '^(Set|Fan_Set)' -and $m.Name -match $pattern) { 'Green' }
+                     elseif ($m.Name -match $pattern) { 'Yellow' }
+                     else { 'Gray' }
+            Write-Host ("    {0,-40} in({1})  out({2})" -f $m.Name, $in, $out) -ForegroundColor $color
+        }
+    }
+    Write-Host ""
+    Write-Host "  Green = an untested setter worth a closer look. Grey = already known." -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+function Invoke-TestModes {
+    $modeBefore = Get-SmartFanMode
+    $log = @()
+    Write-Host ""
+    Write-Host "  Stock curves on this power state: Quiet -> Balanced -> Performance, ${HoldSeconds}s each" -ForegroundColor Cyan
+    Write-Host ("  Starting mode: {0}   On AC: {1}" -f (Format-Mode $modeBefore), (Get-OnAcPower)) -ForegroundColor DarkGray
+    try {
+        if ([int]$modeBefore -eq $CustomModeValue) { Set-TestFullSpeed -On $false }
+        foreach ($m in 1, 2, 3) {
+            Write-Host ""
+            Write-Host ("  -> {0}" -f $ModeNames[$m]) -ForegroundColor Yellow
+            Set-TestMode -Mode $m
+            $log += Watch-TestPhase -Phase $ModeNames[$m] -Seconds $HoldSeconds
+            $last = $log[-1]
+            if ([int]$last.Thermal -ne $m) {
+                Write-Host ("     [!] ThermalMode is {0}, not {1}: the firmware did not apply it here." -f $last.Thermal, $m) -ForegroundColor Yellow
+            }
+        }
+    } catch {
+        Write-Host "  [x] $($_.Exception.Message)" -ForegroundColor Red
+    } finally {
+        Restore-TestState -ModeBefore $modeBefore
+        Write-TestSummary $log
+        Save-TestLog -Name 'modes' -Samples $log
+    }
+    Write-Host ""
+    Write-Host "  If Performance shows thermal 3 with rpm between Balanced and 4300," -ForegroundColor DarkGray
+    Write-Host "  it is a usable 'middle speed' on this power state." -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+function Invoke-TestCustom {
+    $modeBefore = Get-SmartFanMode
+    $log = @()
+    Write-Host ""
+    Write-Host "  Custom Mode on this power state: full speed OFF for ${HoldSeconds}s, then ON" -ForegroundColor Cyan
+    Write-Host ("  Starting mode: {0}   On AC: {1}" -f (Format-Mode $modeBefore), (Get-OnAcPower)) -ForegroundColor DarkGray
+    try {
+        $log += Watch-TestPhase -Phase 'baseline' -Seconds 6
+
+        Set-TestMode -Mode $CustomModeValue
+        Start-Sleep -Seconds 2
+        if ([int](Get-SmartFanMode) -ne $CustomModeValue) {
+            Write-Host "  [FAIL] Custom Mode did not engage here (SmartFanMode is not 255)." -ForegroundColor Red
+            return
+        }
+        Write-Host "  [OK] Custom Mode engaged." -ForegroundColor Green
+
+        Set-TestFullSpeed -On $false
+        Write-Host ""
+        Write-Host "  -> Custom, full speed OFF (what does the EC do with no override?)" -ForegroundColor Yellow
+        $log += Watch-TestPhase -Phase 'custom-off' -Seconds $HoldSeconds
+
+        Set-TestFullSpeed -On $true
+        Write-Host ""
+        Write-Host "  -> Custom, full speed ON" -ForegroundColor Yellow
+        $log += Watch-TestPhase -Phase 'custom-full' -Seconds 12
+
+        $tables = Get-ReadableFanTables
+        Write-Host ""
+        Write-Host ("  Readable fan tables inside Custom here: {0}" -f $tables.Count) -ForegroundColor White
+        foreach ($t in $tables) {
+            Write-Host ("    Fan={0} Sensor={1} Size={2} Table={3}" -f $t.FanId, $t.SensorId, $t.Size, (Format-ProbeValue $t.Table)) -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  [x] $($_.Exception.Message)" -ForegroundColor Red
+    } finally {
+        Restore-TestState -ModeBefore $modeBefore
+        Write-TestSummary $log
+        Save-TestLog -Name 'custom' -Samples $log
+    }
+    Write-Host ""
+}
+
+function Invoke-TestPulse {
+    $modeBefore = Get-SmartFanMode
+    $log = @()
+    Write-Host ""
+    Write-Host ("  Duty-cycle test: full speed ON {0}s / OFF {1}s for {2}s, inside Custom Mode" -f $OnSeconds, $OffSeconds, $DurationSeconds) -ForegroundColor Cyan
+    Write-Host "  Listen: a steady middle tone is a win, an audible surge is not." -ForegroundColor DarkGray
+    try {
+        $log += Watch-TestPhase -Phase 'baseline' -Seconds 6 -StepSeconds 1
+
+        Set-TestMode -Mode $CustomModeValue
+        Start-Sleep -Seconds 2
+        if ([int](Get-SmartFanMode) -ne $CustomModeValue) {
+            Write-Host "  [FAIL] Custom Mode did not engage here (SmartFanMode is not 255)." -ForegroundColor Red
+            return
+        }
+
+        $end = (Get-Date).AddSeconds($DurationSeconds)
+        while ((Get-Date) -lt $end) {
+            Set-TestFullSpeed -On $true
+            $log += Watch-TestPhase -Phase 'pulse' -Seconds $OnSeconds -StepSeconds 1
+            Set-TestFullSpeed -On $false
+            $log += Watch-TestPhase -Phase 'pulse' -Seconds $OffSeconds -StepSeconds 1
+        }
+    } catch {
+        Write-Host "  [x] $($_.Exception.Message)" -ForegroundColor Red
+        try { Set-TestFullSpeed -On $true } catch { }
+    } finally {
+        Restore-TestState -ModeBefore $modeBefore
+        Write-TestSummary $log
+        $p = @($log | Where-Object { $_.Phase -eq 'pulse' -and $null -ne $_.Fan0 } | Select-Object -Skip 5)
+        if ($p.Count -gt 0) {
+            $m = $p | Measure-Object Fan0 -Minimum -Maximum
+            Write-Host ("   Fan0 swing once settled: {0} rpm ({1}-{2})" -f ($m.Maximum - $m.Minimum), $m.Minimum, $m.Maximum) -ForegroundColor White
+            Write-Host "   Under ~400 rpm swing sounds steady; above ~800 is a clear surge." -ForegroundColor DarkGray
+        }
+        Save-TestLog -Name ("pulse-{0}on{1}off" -f $OnSeconds, $OffSeconds) -Samples $log
+    }
+    Write-Host ""
+}
+
+# LenovoLegionToolkit's GodMode V1 layout for Fan_Set_Table (64 bytes):
+#   [0] FSTM mode (LLT writes 1)  [1] FSID fan id  [2..5] FSTL uint32 = 0
+#   [6..25] FSS0..FSS9, ten uint16 LE fan LEVELS 0-10 (not rpm)  [26..63] 0
+# The firmware owns the temperature points. LLT writes this blind, without
+# reading Fan_Get_Table first -- which is why our 'custom curve' never tried.
+function New-FanTableBytes {
+    param([int[]]$Levels, [int]$Mode = 1)
+    $b = New-Object byte[] 64
+    $b[0] = [byte]$Mode
+    for ($i = 0; $i -lt 10; $i++) {
+        $b[6 + 2 * $i] = [byte]$Levels[$i]
+        $b[7 + 2 * $i] = 0
+    }
+    return , $b
+}
+
+function Set-TestFanTable {
+    param([int[]]$Levels, [int]$Mode)
+    $bytes = New-FanTableBytes -Levels $Levels -Mode $Mode
+    $null = Get-FanMethodInstance | Invoke-CimMethod -MethodName Fan_Set_Table -Arguments @{ FanTable = [byte[]]$bytes } -ErrorAction Stop
+}
+
+function Show-FanTableData {
+    try {
+        foreach ($inst in @(Get-CimInstance -Namespace $WmiNamespace -ClassName 'LENOVO_FAN_TABLE_DATA' -ErrorAction Stop)) {
+            Write-Host ("   LENOVO_FAN_TABLE_DATA: Fan_Id {0}  FanTable_Len {1}  FanTable_Data {2}  CurrentFanMaxSpeed {3}" -f `
+                $inst.Fan_Id, $inst.FanTable_Len, (Format-ProbeValue $inst.FanTable_Data), $inst.CurrentFanMaxSpeed) -ForegroundColor DarkGray
+        }
+    } catch { Write-Host "   LENOVO_FAN_TABLE_DATA: $($_.Exception.Message.Trim())" -ForegroundColor DarkGray }
+}
+
+function Invoke-TestTable {
+    $modeBefore = Get-SmartFanMode
+    $level = [math]::Min(10, [math]::Max(3, $Level))
+    $mode = if ($TableMode -eq 255) { 255 } else { 1 }
+    $flat = @($level) * 10
+    $default = 1..10
+    $log = @()
+    Write-Host ""
+    Write-Host ("  Blind Fan_Set_Table: flat level {0} (all 10 points), byte0 = {1}, inside Custom Mode" -f $level, $mode) -ForegroundColor Cyan
+    Write-Host "  Success looks like rpm settling somewhere other than 2300 / 4300." -ForegroundColor DarkGray
+    try {
+        $log += Watch-TestPhase -Phase 'baseline' -Seconds 6
+
+        Set-TestMode -Mode $CustomModeValue
+        Start-Sleep -Seconds 2
+        if ([int](Get-SmartFanMode) -ne $CustomModeValue) {
+            Write-Host "  [FAIL] Custom Mode did not engage here (SmartFanMode is not 255)." -ForegroundColor Red
+            return
+        }
+        Set-TestFullSpeed -On $false
+
+        Write-Host ""
+        Write-Host ("  -> Fan_Set_Table(level {0} x 10)" -f $level) -ForegroundColor Yellow
+        try {
+            Set-TestFanTable -Levels $flat -Mode $mode
+            Write-Host "     call returned without error." -ForegroundColor DarkGray
+        } catch {
+            Write-Host "     threw: $($_.Exception.Message.Trim())" -ForegroundColor Red
+            return
+        }
+        Show-FanTableData
+        $tables = Get-ReadableFanTables
+        Write-Host ("   Readable fan tables now: {0}" -f $tables.Count) -ForegroundColor DarkGray
+        $log += Watch-TestPhase -Phase ("level-{0}" -f $level) -Seconds $HoldSeconds
+
+        Write-Host ""
+        Write-Host "  -> Fan_Set_Table(default 1..10)" -ForegroundColor Yellow
+        Set-TestFanTable -Levels $default -Mode $mode
+        $log += Watch-TestPhase -Phase 'default-table' -Seconds 20
+    } catch {
+        Write-Host "  [x] $($_.Exception.Message)" -ForegroundColor Red
+        try { Set-TestFullSpeed -On $true } catch { }
+    } finally {
+        try { Set-TestFanTable -Levels $default -Mode $mode } catch { }
+        Restore-TestState -ModeBefore $modeBefore
+        Write-TestSummary $log
+        Save-TestLog -Name ("table-L{0}-m{1}" -f $level, $mode) -Samples $log
+    }
+    Write-Host ""
+}
+
+function Invoke-Test {
+    param([string]$Action)
+    switch -Regex ($Action) {
+        '^power$'   { Invoke-TestPower; break }
+        '^methods$' { if (Assert-Admin -Action 'test methods') { Invoke-TestMethods }; break }
+        '^(modes|custom|pulse|table)$' {
+            if (-not (Assert-Admin -Action "test $Action")) { break }
+            if (-not (Assert-NoTrayApp)) { break }
+            switch ($Action) {
+                'modes'  { Invoke-TestModes }
+                'custom' { Invoke-TestCustom }
+                'pulse'  { Invoke-TestPulse }
+                'table'  { Invoke-TestTable }
+            }
+            break
+        }
+        default {
+            Write-Host ""
+            Write-Host "  [x] 'test' expects: power | methods | modes | custom | pulse | table" -ForegroundColor Red
+            Write-Host "      Got: '$Action'" -ForegroundColor Red
+            Write-Host ""
+        }
+    }
+}
+
+# =============================================================================
 # Subcommand: help  (default)
 # =============================================================================
 
@@ -1403,7 +1850,7 @@ function Show-Usage {
     Write-Host "                       pin both fans at 4300 rpm in a single step. Confirmed on"
     Write-Host "                       BIOS HACN46WW: 2800 -> 4300 rpm. Release with 'custom off'."
     Write-Host ""
-    Write-Host "    custom off         [ADMIN] Leave Custom Mode, restore Balanced. ALWAYS run"
+    Write-Host "    custom off         [ADMIN] Leave Custom Mode, restore the previous mode. ALWAYS run"
     Write-Host "                       this when you're done — the host owns the fans until you do."
     Write-Host "    custom status      [ADMIN] Show Custom Mode state and readable fan tables."
     Write-Host "    custom on          [ADMIN] Unlock Custom Mode only, without touching the fans."
@@ -1425,6 +1872,22 @@ function Show-Usage {
     Write-Host "                       Default 99 (disables Turbo). Try 80 for more headroom."
     Write-Host ""
     Write-Host "    uncap              [ADMIN] Restore CPU max processor state to 100%."
+    Write-Host ""
+    Write-Host "    test power         Read-only: is the charger seen as AC, and is the battery"
+    Write-Host "                       still draining (weak charger)?"
+    Write-Host "    test methods       [ADMIN] Read-only: every LENOVO_* method + parameters,"
+    Write-Host "                       highlighting any untested speed/level setter."
+    Write-Host "    test modes         [ADMIN] Quiet -> Balanced -> Performance, -HoldSeconds each,"
+    Write-Host "                       logging rpm. Shows whether Performance works on this power."
+    Write-Host "    test custom        [ADMIN] Custom Mode with full speed OFF, then ON, logging rpm."
+    Write-Host "    test pulse         [ADMIN] Toggle full speed -OnSeconds / -OffSeconds for"
+    Write-Host "                       -DurationSeconds: can a duty cycle make a middle speed?"
+    Write-Host "    test table         [ADMIN] Blind Fan_Set_Table with a flat -Level (3-10, fan"
+    Write-Host "                       level not rpm; LenovoLegionToolkit layout), -TableMode 1|255."
+    Write-Host "                       Restores the default 1..10 table afterwards."
+    Write-Host "                       Write tests restore the starting mode, abort at -MaxTempC"
+    Write-Host "                       (default 90), refuse while LegionFanTray.exe runs, and save"
+    Write-Host "                       test-*.csv next to the script."
     Write-Host ""
     Write-Host "    help               Show this message (default)."
     Write-Host ""
@@ -1491,6 +1954,10 @@ switch ($Command) {
     'custom' {
         $action = if ([string]::IsNullOrWhiteSpace($Value)) { 'status' } else { $Value }
         Invoke-Custom -Action $action -Arg $Value2
+    }
+
+    'test' {
+        Invoke-Test -Action $Value
     }
 
     'force' {

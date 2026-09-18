@@ -6,3 +6,7 @@ obj/
 # Visual Studio
 .vs/
 *.user
+
+# Script output
+scripts/probe-*.txt
+scripts/test-*.csv
