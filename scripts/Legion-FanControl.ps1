@@ -99,6 +99,12 @@ param(
     [int]$Level = 5,
     [int]$TableMode = 1,
 
+    # `test powerlimit`: sustained (long-term) CPU limit to try, optional
+    # short-term limit (defaults to the same), and -NoLoad to supply your own.
+    [int]$Watts = 0,
+    [int]$ShortWatts = 0,
+    [switch]$NoLoad,
+
     # Temporarily stop Lenovo Vantage / ImController around the write, then
     # restore them. Used to prove whether Vantage is reverting host writes.
     [switch]$SuspendVantage
@@ -1801,11 +1807,225 @@ function Invoke-TestTable {
     Write-Host ""
 }
 
+# --- test powerlimit ---------------------------------------------------------
+# LENOVO_CPU_METHOD exposes the vendor's own sustained (long-term, PL1-like)
+# and boost (short-term, PL2-like) CPU power limits. Less heat means the stock
+# curve keeps up on its own and auto-max rarely needs full speed.
+#
+# Guard rails: the limit can only be LOWERED (never above the value read at
+# the start), is snapped to the firmware's step and minimum, and the original
+# values are saved to disk first so 'test powerlimit restore' can put them
+# back even if a run is killed.
+
+$CpuMethodClass = 'LENOVO_CPU_METHOD'
+$PowerLimitFile = Join-Path $env:LOCALAPPDATA 'LegionFanTray\script-powerlimit-original.txt'
+
+function Get-CpuPowerLimits {
+    $inst = Get-CimInstance -Namespace $WmiNamespace -ClassName $CpuMethodClass -ErrorAction Stop
+    $l = $inst | Invoke-CimMethod -MethodName CPU_Get_LongTerm_PowerLimit -ErrorAction Stop
+    $s = $inst | Invoke-CimMethod -MethodName CPU_Get_ShortTerm_PowerLimit -ErrorAction Stop
+    [pscustomobject]@{
+        Long = [int]$l.CurrentLongTerm_PowerLimit;  LongMin = [int]$l.MinLongTerm_PowerLimit
+        LongMax = [int]$l.MaxLongTerm_PowerLimit;   LongStep = [int]$l.step
+        Short = [int]$s.CurrentShortTerm_PowerLimit; ShortMin = [int]$s.MinShortTerm_PowerLimit
+        ShortMax = [int]$s.MaxShortTerm_PowerLimit;  ShortStep = [int]$s.step
+    }
+}
+
+function Set-CpuPowerLimits {
+    param([int]$Long, [int]$Short)
+    $inst = Get-CimInstance -Namespace $WmiNamespace -ClassName $CpuMethodClass -ErrorAction Stop
+    # Short-term first when lowering, so it never sits below the long-term limit.
+    $null = $inst | Invoke-CimMethod -MethodName CPU_Set_ShortTerm_PowerLimit -Arguments @{ value = [uint32]$Short } -ErrorAction Stop
+    $null = $inst | Invoke-CimMethod -MethodName CPU_Set_LongTerm_PowerLimit  -Arguments @{ value = [uint32]$Long }  -ErrorAction Stop
+}
+
+function Write-CpuPowerLimits {
+    param($P, [string]$Label)
+    Write-Host ("   {0,-9} long-term {1} (min {2}, max {3}, step {4})   short-term {5} (min {6}, max {7}, step {8})" -f `
+        $Label, $P.Long, $P.LongMin, $P.LongMax, $P.LongStep, $P.Short, $P.ShortMin, $P.ShortMax, $P.ShortStep)
+}
+
+function Show-GpuPowerLimits {
+    try {
+        $inst = Get-CimInstance -Namespace $WmiNamespace -ClassName 'LENOVO_GPU_METHOD' -ErrorAction Stop
+        $c = $inst | Invoke-CimMethod -MethodName GPU_Get_cTGP_PowerLimit -ErrorAction Stop
+        $p = $inst | Invoke-CimMethod -MethodName GPU_Get_PPAB_PowerLimit -ErrorAction Stop
+        Write-Host ("   GPU       cTGP {0} (min {1}, max {2})   PPAB {3} (min {4}, max {5})   [read-only here]" -f `
+            $c.Current_cTGP_PowerLimit, $c.Min_cTGP_PowerLimit, $c.Max_cTGP_PowerLimit,
+            $p.CurrentPPAB_PowerLimit, $p.MinPPAB_PowerLimit, $p.MaxPPAB_PowerLimit) -ForegroundColor DarkGray
+    } catch { Write-Host "   GPU limits: $($_.Exception.Message.Trim())" -ForegroundColor DarkGray }
+}
+
+function Get-SnappedLimit {
+    param([int]$Want, [int]$Min, [int]$Ceiling, [int]$Step)
+    $v = [math]::Min($Want, $Ceiling)
+    if ($Step -gt 1) { $v = $Min + [math]::Floor(($v - $Min) / $Step) * $Step }
+    return [int][math]::Max($Min, $v)
+}
+
+# One busy loop per logical CPU, each self-terminating at the deadline so a
+# killed test cannot leave load running.
+function Start-CpuLoad {
+    param([int]$Seconds)
+    $until = [DateTime]::UtcNow.AddSeconds($Seconds)
+    1..[Environment]::ProcessorCount | ForEach-Object {
+        Start-ThreadJob -ScriptBlock {
+            $x = 1.0
+            while ([DateTime]::UtcNow -lt $using:until) { $x = [math]::Sqrt($x + 12345.678) }
+        }
+    }
+}
+
+function Stop-CpuLoad {
+    param($Jobs)
+    if ($Jobs) { $Jobs | Stop-Job -ErrorAction SilentlyContinue; $Jobs | Remove-Job -Force -ErrorAction SilentlyContinue }
+}
+
+function Restore-CpuPowerLimits {
+    if (-not (Test-Path $PowerLimitFile)) {
+        Write-Host "  [OK] No saved power limits: nothing to restore." -ForegroundColor Green
+        return
+    }
+    $parts = (Get-Content $PowerLimitFile -TotalCount 1) -split ','
+    $long = [int]$parts[0]; $short = [int]$parts[1]
+    try {
+        Set-CpuPowerLimits -Long $long -Short $short
+        $now = Get-CpuPowerLimits
+        if ($now.Long -eq $long -and $now.Short -eq $short) {
+            Write-Host ("  [RESTORED] CPU power limits long-term {0}, short-term {1}" -f $long, $short) -ForegroundColor Cyan
+            Remove-Item $PowerLimitFile -ErrorAction SilentlyContinue
+        } else {
+            Write-Host ("  [!] Wrote long {0} / short {1}, reads back {2} / {3}. Saved values kept in {4}" -f `
+                $long, $short, $now.Long, $now.Short, $PowerLimitFile) -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  [x] Restore failed: $($_.Exception.Message.Trim()). Saved values kept in $PowerLimitFile" -ForegroundColor Red
+    }
+}
+
+function Invoke-TestPowerLimit {
+    param([string]$Sub)
+
+    if ($Sub -match '^restore$') { Restore-CpuPowerLimits; return }
+
+    Write-Host ""
+    Write-Host "  CPU power limits (LENOVO_CPU_METHOD)" -ForegroundColor Cyan
+    try { $orig = Get-CpuPowerLimits }
+    catch {
+        Write-Host "  [x] Cannot read the CPU power limits: $($_.Exception.Message.Trim())" -ForegroundColor Red
+        return
+    }
+    Write-CpuPowerLimits $orig 'now'
+    Show-GpuPowerLimits
+    Write-Host ("   Mode      {0}   On AC: {1}" -f (Format-Mode (Get-SmartFanMode)), (Get-OnAcPower)) -ForegroundColor DarkGray
+
+    if (Test-Path $PowerLimitFile) {
+        Write-Host ""
+        Write-Host "  [!] A previous run left saved limits in $PowerLimitFile." -ForegroundColor Yellow
+        Write-Host "      Put them back first:  .\Legion-FanControl.ps1 test powerlimit restore" -ForegroundColor Yellow
+        return
+    }
+
+    if ($Watts -le 0) {
+        Write-Host ""
+        Write-Host "  Read-only. To test a lower sustained limit under load, e.g.:" -ForegroundColor DarkGray
+        Write-Host "    .\Legion-FanControl.ps1 test powerlimit -Watts 35 -HoldSeconds 90" -ForegroundColor Cyan
+        Write-Host ""
+        return
+    }
+    if (-not (Assert-NoTrayApp)) { return }
+
+    # Only ever lower, never below the firmware minimum, snapped to its step.
+    $long  = Get-SnappedLimit -Want $Watts -Min $orig.LongMin -Ceiling $orig.Long -Step $orig.LongStep
+    $wantShort = if ($ShortWatts -gt 0) { $ShortWatts } else { $long }
+    $short = Get-SnappedLimit -Want ([math]::Max($wantShort, $long)) -Min $orig.ShortMin -Ceiling $orig.Short -Step $orig.ShortStep
+    if ($short -lt $long) { $short = $long }
+    if ($Watts -ne $long) {
+        Write-Host ("  [!] -Watts {0} adjusted to {1}: this test only lowers, and the current long-term limit is {2} (min {3})." -f `
+            $Watts, $long, $orig.Long, $orig.LongMin) -ForegroundColor Yellow
+    }
+    if ($long -ge $orig.Long -and $short -ge $orig.Short) {
+        Write-Host "  [!] -Watts $Watts is not below the current limits; nothing to test (this test only lowers)." -ForegroundColor Yellow
+        return
+    }
+
+    $modeBefore = Get-SmartFanMode
+    $log = @()
+    $jobs = $null
+    Write-Host ""
+    Write-Host ("  Plan: {0}s under {1} at the stock limits, then {0}s at long-term {2} / short-term {3}." -f `
+        $HoldSeconds, $(if ($NoLoad) { 'your own load' } else { "a $([Environment]::ProcessorCount)-thread CPU load" }), $long, $short) -ForegroundColor White
+
+    try {
+        Set-Content -Path $PowerLimitFile -Value ("{0},{1}" -f $orig.Long, $orig.Short) -ErrorAction Stop
+    } catch {
+        Write-Host "  [x] Cannot save the original limits ($($_.Exception.Message.Trim())). Not writing anything." -ForegroundColor Red
+        return
+    }
+
+    try {
+        if (-not $NoLoad) { $jobs = Start-CpuLoad -Seconds (2 * $HoldSeconds + 30) }
+
+        Write-Host ""
+        Write-Host "  -> stock limits" -ForegroundColor Yellow
+        $log += Watch-TestPhase -Phase 'stock' -Seconds $HoldSeconds
+
+        Write-Host ""
+        Write-Host ("  -> writing long-term {0}, short-term {1} in {2}" -f $long, $short, (Format-Mode (Get-SmartFanMode))) -ForegroundColor Yellow
+        Set-CpuPowerLimits -Long $long -Short $short
+        Start-Sleep -Seconds 1
+        $after = Get-CpuPowerLimits
+        Write-CpuPowerLimits $after 'readback'
+        $took = ($after.Long -eq $long)
+        if (-not $took) {
+            Write-Host "     [!] The firmware did not take the long-term limit in this mode." -ForegroundColor Yellow
+            Write-Host "         LenovoLegionToolkit applies these in Custom Mode, so trying there." -ForegroundColor Yellow
+            Write-Host "         NOTE: in Custom the fans do not follow a curve; the -MaxTempC guard is the safety net." -ForegroundColor Yellow
+            Set-TestMode -Mode $CustomModeValue
+            Start-Sleep -Seconds 2
+            Set-TestFullSpeed -On $false
+            Set-CpuPowerLimits -Long $long -Short $short
+            Start-Sleep -Seconds 1
+            $after = Get-CpuPowerLimits
+            Write-CpuPowerLimits $after 'custom'
+            $took = ($after.Long -eq $long)
+            if (-not $took) { Write-Host "     [NO-OP] Not taken in Custom either." -ForegroundColor Red }
+        }
+        $phase = if ($took) { "limit-$long" } else { 'limit-not-taken' }
+        $log += Watch-TestPhase -Phase $phase -Seconds $HoldSeconds
+    } catch {
+        Write-Host "  [x] $($_.Exception.Message)" -ForegroundColor Red
+        try { Set-TestFullSpeed -On $true } catch { }
+    } finally {
+        Stop-CpuLoad $jobs
+        Write-Host ""
+        Restore-CpuPowerLimits
+        Restore-TestState -ModeBefore $modeBefore
+        Write-TestSummary $log
+        foreach ($g in ($log | Group-Object Phase)) {
+            $t = $g.Group | Where-Object { $null -ne $_.CpuC } | Select-Object -Last ([math]::Max(1, [int]($g.Count / 2))) | Measure-Object CpuC -Average -Maximum
+            Write-Host ("   {0,-16} CPU temp, second half: avg {1:N0} C, max {2} C" -f $g.Name, $t.Average, $t.Maximum)
+        }
+        Save-TestLog -Name ("powerlimit-{0}" -f $long) -Samples $log
+    }
+    Write-Host ""
+    Write-Host "  A win: noticeably lower CPU temp (and rpm) in the limited phase for an" -ForegroundColor DarkGray
+    Write-Host "  acceptable loss of speed. The second phase starts warmer, so a small" -ForegroundColor DarkGray
+    Write-Host "  difference is inside the noise." -ForegroundColor DarkGray
+    Write-Host ""
+}
+
 function Invoke-Test {
-    param([string]$Action)
+    param([string]$Action, [string]$Sub)
     switch -Regex ($Action) {
         '^power$'   { Invoke-TestPower; break }
         '^methods$' { if (Assert-Admin -Action 'test methods') { Invoke-TestMethods }; break }
+        '^powerlimit$' {
+            if (-not (Assert-Admin -Action 'test powerlimit')) { break }
+            Invoke-TestPowerLimit -Sub $Sub
+            break
+        }
         '^(modes|custom|pulse|table)$' {
             if (-not (Assert-Admin -Action "test $Action")) { break }
             if (-not (Assert-NoTrayApp)) { break }
@@ -1819,7 +2039,7 @@ function Invoke-Test {
         }
         default {
             Write-Host ""
-            Write-Host "  [x] 'test' expects: power | methods | modes | custom | pulse | table" -ForegroundColor Red
+            Write-Host "  [x] 'test' expects: power | methods | modes | custom | pulse | table | powerlimit" -ForegroundColor Red
             Write-Host "      Got: '$Action'" -ForegroundColor Red
             Write-Host ""
         }
@@ -1885,6 +2105,12 @@ function Show-Usage {
     Write-Host "    test table         [ADMIN] Blind Fan_Set_Table with a flat -Level (3-10, fan"
     Write-Host "                       level not rpm; LenovoLegionToolkit layout), -TableMode 1|255."
     Write-Host "                       Restores the default 1..10 table afterwards."
+    Write-Host "    test powerlimit    [ADMIN] Read the CPU/GPU power limits. With -Watts N: run"
+    Write-Host "                       a CPU load at stock limits, then at long-term N (short-term"
+    Write-Host "                       -ShortWatts, default N), comparing temps and rpm. Only ever"
+    Write-Host "                       LOWERS; originals are saved first and always restored."
+    Write-Host "                       -NoLoad uses your own load.  'test powerlimit restore'"
+    Write-Host "                       puts saved limits back after an interrupted run."
     Write-Host "                       Write tests restore the starting mode, abort at -MaxTempC"
     Write-Host "                       (default 90), refuse while LegionFanTray.exe runs, and save"
     Write-Host "                       test-*.csv next to the script."
@@ -1957,7 +2183,7 @@ switch ($Command) {
     }
 
     'test' {
-        Invoke-Test -Action $Value
+        Invoke-Test -Action $Value -Sub $Value2
     }
 
     'force' {

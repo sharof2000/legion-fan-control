@@ -112,7 +112,7 @@ The doc and the script contradicted each other for two months on point 1 — the
 | `mode <q\|b\|p>` | EC curve modes. Performance is AC-only and will not pin the fans. |
 | `force <on\|off>` | Raw `Fan_Set_FullSpeed` outside Custom Mode. Expected to no-op. |
 | `cap [percent]` / `uncap` | `powercfg PROCTHROTTLEMAX`. Heat at the source. |
-| `test <power\|methods\|modes\|custom\|pulse\|table>` | Measured experiments for Round 3. Write tests restore the starting mode and abort at `-MaxTempC`. |
+| `test <power\|methods\|modes\|custom\|pulse\|table\|powerlimit>` | Measured experiments for Round 3. Write tests restore the starting mode and abort at `-MaxTempC`. |
 | `-SuspendVantage` | Stops Vantage services around a write, restores in `finally`. Not needed on this machine, but keeps the diagnostic available. |
 
 ---

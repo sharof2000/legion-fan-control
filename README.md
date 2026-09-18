@@ -278,7 +278,7 @@ The subcommands, in full:
 | `mode <q\|b\|p>` | Set Quiet / Balanced / Performance, verified by reading `ThermalMode` back. |
 | `force` | Attempt `Fan_Set_FullSpeed` on its own, then verify by RPM readback. |
 | `cap <percent>` | Cap CPU max processor state via `powercfg`. `uncap` restores 100%. |
-| `test <name>` | Experiments: `power`, `methods` (read-only), `modes`, `custom`, `pulse`, `table`. Each logs rpm to `test-*.csv` and restores the starting mode. See Round 3 in [`docs/findings.md`](docs/findings.md). |
+| `test <name>` | Experiments: `power`, `methods` (read-only), `modes`, `custom`, `pulse`, `table`, `powerlimit`. Each logs rpm to `test-*.csv` and restores the starting mode. See Round 3 in [`docs/findings.md`](docs/findings.md). |
 | `help` | Usage. The default when you give it nothing. |
 
 ```powershell
