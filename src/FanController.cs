@@ -18,6 +18,9 @@ internal sealed class FanSnapshot
     public uint? ThermalMode { get; init; }
     public bool? FullSpeed { get; init; }
     public bool OnAc { get; init; }
+
+    /// <summary>Plugged in, but the battery is still draining: a weak charger.</summary>
+    public bool LowPowerCharger { get; init; }
     public int MaxRpm { get; init; } = LenovoWmi.FallbackMaxRpm;
     public FanOwner Owner { get; init; }
     public bool AutoMaxEnabled { get; init; }
@@ -56,6 +59,9 @@ internal sealed class FanController : IDisposable
     /// <summary>Idle rate when nothing is watching and no curve is running.</summary>
     private const int IdleIntervalMs = 5000;
 
+    /// <summary>How long auto-max waits after a failed engage before trying again.</summary>
+    private static readonly TimeSpan AutoRetryBackoff = TimeSpan.FromSeconds(60);
+
     private readonly LenovoWmi _wmi;
     private readonly Settings _settings;
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -66,6 +72,14 @@ internal sealed class FanController : IDisposable
     private int _highSamples;
     private int _lowSamples;
     private int _releasedOnce;
+    private DateTime _nextAutoAttempt = DateTime.MinValue;
+
+    /// <summary>
+    /// Stock mode (1/2/3) that was active before Custom was engaged, so the
+    /// release goes back to it. A low-wattage charger locks the EC to Quiet;
+    /// asking for Balanced there would only be refused.
+    /// </summary>
+    private uint? _modeBeforeCustom;
 
     public FanController(LenovoWmi wmi, Settings settings)
     {
@@ -145,20 +159,25 @@ internal sealed class FanController : IDisposable
         }
     }
 
-    private FanSnapshot Read() => new()
+    private FanSnapshot Read()
     {
-        CpuC = _wmi.GetCpuTemp(),
-        GpuC = _wmi.GetGpuTemp(),
-        Fan0Rpm = _wmi.GetFanRpm(LenovoWmi.Fan0),
-        Fan1Rpm = _wmi.GetFanRpm(LenovoWmi.Fan1),
-        SmartFanMode = _wmi.GetSmartFanMode(),
-        ThermalMode = _wmi.GetThermalMode(),
-        FullSpeed = _wmi.GetFullSpeed(),
-        OnAc = _wmi.IsOnAc(),
-        MaxRpm = _wmi.GetMaxRpm(),
-        Owner = _owner,
-        AutoMaxEnabled = _settings.AutoMaxEnabled,
-    };
+        bool onAc = _wmi.IsOnAc();
+        return new()
+        {
+            CpuC = _wmi.GetCpuTemp(),
+            GpuC = _wmi.GetGpuTemp(),
+            Fan0Rpm = _wmi.GetFanRpm(LenovoWmi.Fan0),
+            Fan1Rpm = _wmi.GetFanRpm(LenovoWmi.Fan1),
+            SmartFanMode = _wmi.GetSmartFanMode(),
+            ThermalMode = _wmi.GetThermalMode(),
+            FullSpeed = _wmi.GetFullSpeed(),
+            OnAc = onAc,
+            LowPowerCharger = onAc && _wmi.IsBatteryDraining(),
+            MaxRpm = _wmi.GetMaxRpm(),
+            Owner = _owner,
+            AutoMaxEnabled = _settings.AutoMaxEnabled,
+        };
+    }
 
     // --- the software fan curve ---------------------------------------------
 
@@ -166,34 +185,58 @@ internal sealed class FanController : IDisposable
     /// Two-point curve with hysteresis, because the firmware refuses
     /// Fan_Set_Table (FanTable_Len is 0 on every FanID x SensorID pair, even
     /// inside Custom Mode). Full-speed toggling is all the hardware offers.
+    ///
+    /// Only engaging is gated on AC. Once auto owns the fans, the release path
+    /// always runs: a flaky power reading must never leave them pinned.
     /// </summary>
     private async Task EvaluateCurveAsync(FanSnapshot snap, CancellationToken ct)
     {
-        if (!_settings.AutoMaxEnabled || !snap.OnAc || snap.CpuC is null)
+        // The EC left Custom Mode by itself (e.g. charger pulled). Nothing is
+        // pinned any more, so stop claiming ownership.
+        if (_owner == FanOwner.Auto && snap.SmartFanMode is not null && !snap.CustomEngaged)
         {
+            _owner = FanOwner.None;
             _highSamples = 0;
             _lowSamples = 0;
+            ClearLock();
+            Notice?.Invoke("The firmware left Custom Mode on its own. Auto-max stood down.", false);
             return;
         }
 
         // A human pinned the fans. Stay out of it until they release.
         if (_owner == FanOwner.Manual) return;
 
-        int cpu = snap.CpuC.Value;
-
         if (_owner != FanOwner.Auto)
         {
             _lowSamples = 0;
+            if (!_settings.AutoMaxEnabled || !snap.OnAc || snap.CpuC is null)
+            {
+                _highSamples = 0;
+                return;
+            }
+
+            int cpu = snap.CpuC.Value;
             _highSamples = cpu >= _settings.HighThresholdC ? _highSamples + 1 : 0;
-            if (_highSamples >= _settings.EnterSamples)
+            if (_highSamples >= _settings.EnterSamples && DateTime.UtcNow >= _nextAutoAttempt)
             {
                 _highSamples = 0;
                 var r = await EngageMaxAsync(FanOwner.Auto, ct).ConfigureAwait(false);
+                if (!r.Ok) _nextAutoAttempt = DateTime.UtcNow + AutoRetryBackoff;
                 Notice?.Invoke("Auto-max engaged at " + cpu + " C. " + r.Message, !r.Ok);
             }
         }
         else
         {
+            // Turning auto-max off while it holds the fans hands them back.
+            if (!_settings.AutoMaxEnabled)
+            {
+                var off = await ReleaseAsync(FanOwner.Auto, ct).ConfigureAwait(false);
+                Notice?.Invoke("Auto-max turned off. " + off.Message, !off.Ok);
+                return;
+            }
+            if (snap.CpuC is null) return;
+
+            int cpu = snap.CpuC.Value;
             _highSamples = 0;
             _lowSamples = cpu <= _settings.LowThresholdC ? _lowSamples + 1 : 0;
             if (_lowSamples >= _settings.ExitSamples)
@@ -221,6 +264,11 @@ internal sealed class FanController : IDisposable
 
             int? before0 = _wmi.GetFanRpm(LenovoWmi.Fan0);
             int? before1 = _wmi.GetFanRpm(LenovoWmi.Fan1);
+
+            // Remember where to go back to. Re-engaging from inside Custom
+            // must not overwrite the original stock mode.
+            var current = _wmi.GetSmartFanMode();
+            if (IsStockMode(current)) _modeBeforeCustom = current;
 
             try { _wmi.SetSmartFanMode(LenovoWmi.ModeCustom); }
             catch (Exception ex) { return WriteResult.Failure("SetSmartFanMode(255) threw: " + ex.Message); }
@@ -276,16 +324,23 @@ internal sealed class FanController : IDisposable
             try { _wmi.SetFullSpeed(false); }
             catch (Exception ex) { return WriteResult.Failure("Fan_Set_FullSpeed(false) threw: " + ex.Message); }
 
-            try { _wmi.SetSmartFanMode(LenovoWmi.ModeBalanced); }
-            catch (Exception ex) { return WriteResult.Failure("SetSmartFanMode(2) threw: " + ex.Message); }
+            uint target = _modeBeforeCustom ?? LenovoWmi.ModeBalanced;
+            try { _wmi.SetSmartFanMode(target); }
+            catch (Exception ex) { return WriteResult.Failure("SetSmartFanMode(" + target + ") threw: " + ex.Message); }
 
             await Task.Delay(600, ct).ConfigureAwait(false);
 
             var mode = _wmi.GetSmartFanMode();
             _owner = FanOwner.None;
+            _modeBeforeCustom = null;
             ClearLock();
 
-            if (mode == LenovoWmi.ModeBalanced) return WriteResult.Success("Released. Back to Balanced.");
+            // Out of Custom is what matters. The EC may pick a different stock
+            // mode than asked for (a low-wattage charger locks Quiet).
+            if (mode == target) return WriteResult.Success("Released. Back to " + LenovoWmi.ModeName(mode) + ".");
+            if (IsStockMode(mode))
+                return WriteResult.Success("Released. Back to " + LenovoWmi.ModeName(mode) +
+                    " (the firmware kept " + LenovoWmi.ModeName(mode) + "; a low-wattage charger locks Quiet).");
             return WriteResult.Failure("Released full speed, but the mode reads " + LenovoWmi.ModeName(mode) + ".");
         }
         catch (OperationCanceledException) { return WriteResult.Failure("Cancelled."); }
@@ -312,6 +367,7 @@ internal sealed class FanController : IDisposable
 
             await Task.Delay(600, ct).ConfigureAwait(false);
             _owner = FanOwner.None;
+            _modeBeforeCustom = null;
 
             // For modes 1/2/3 ThermalMode IS the oracle: Performance is
             // AC-gated and silently will not take on battery.
@@ -349,6 +405,9 @@ internal sealed class FanController : IDisposable
     }
 
     // --- helpers ------------------------------------------------------------
+
+    private static bool IsStockMode(uint? mode) =>
+        mode is LenovoWmi.ModeQuiet or LenovoWmi.ModeBalanced or LenovoWmi.ModePerformance;
 
     private static int Delta(int? a, int? b) =>
         a.HasValue && b.HasValue ? Math.Abs(b.Value - a.Value) : 0;

@@ -1201,7 +1201,7 @@ internal sealed class DashboardForm : Form
             FanOwner.Auto => "  ·  set by auto-max",
             _ => "",
         };
-        _status.Text = s.ModeText + "  ·  " + (s.OnAc ? "AC" : "Battery") + owner;
+        _status.Text = s.ModeText + "  ·  " + (s.LowPowerCharger ? "AC (low-power charger)" : s.OnAc ? "AC" : "Battery") + owner;
         _status.ForeColor = s.FansPinned ? WarnText : Fg;
 
         _nvStatus.Text = NvidiaHints.Describe(s.OnAc);

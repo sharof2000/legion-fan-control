@@ -201,10 +201,39 @@ internal sealed class LenovoWmi : IDisposable
     }
 
     /// <summary>
-    /// Custom Mode and Performance are AC-gated. BatteryStatus == 2 means the
-    /// machine is on mains. No battery instance at all means treat as AC.
+    /// Custom Mode and Performance are AC-gated. Asks Windows whether a charger
+    /// is connected (ACLineStatus), not what the battery is doing: a
+    /// low-wattage charger that cannot keep up leaves BatteryStatus at 1
+    /// (discharging) while still plugged in, and the firmware still accepts
+    /// Custom Mode there.
     /// </summary>
     public bool IsOnAc()
+    {
+        try
+        {
+            switch (SystemInformation.PowerStatus.PowerLineStatus)
+            {
+                case PowerLineStatus.Online: return true;
+                case PowerLineStatus.Offline: return false;
+            }
+        }
+        catch { /* fall back to Win32_Battery */ }
+
+        // 2 = on AC, 3 = fully charged, 6-9 = charging. No battery instance at
+        // all means treat as AC.
+        var statuses = GetBatteryStatuses();
+        if (statuses is null || statuses.Count == 0) return true;
+        return statuses.Any(s => s is 2 or 3 or (>= 6 and <= 9));
+    }
+
+    /// <summary>
+    /// True when a battery reports discharging (BatteryStatus 1). Together with
+    /// IsOnAc that identifies a charger too weak to cover the load.
+    /// </summary>
+    public bool IsBatteryDraining() =>
+        GetBatteryStatuses()?.Contains(1) == true;
+
+    private static List<int>? GetBatteryStatuses()
     {
         try
         {
@@ -212,16 +241,15 @@ internal sealed class LenovoWmi : IDisposable
             scope.Connect();
             using var searcher = new ManagementObjectSearcher(scope,
                 new ObjectQuery("SELECT BatteryStatus FROM Win32_Battery"));
-            bool any = false;
+            var list = new List<int>();
             foreach (ManagementBaseObject o in searcher.Get())
             {
                 using var mo = o;
-                any = true;
-                if (ToInt(mo["BatteryStatus"]) == 2) return true;
+                if (ToInt(mo["BatteryStatus"]) is int s) list.Add(s);
             }
-            return !any;
+            return list;
         }
-        catch { return true; }
+        catch { return null; }
     }
 
     // --- writes. These throw on failure. The caller verifies by readback and
